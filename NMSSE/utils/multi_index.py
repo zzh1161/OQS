@@ -6,6 +6,11 @@ import math
 import numpy as np
 
 try:
+    from tqdm import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    tqdm = None
+
+try:
     from numba import njit, prange  # type: ignore
 except Exception:  # pragma: no cover
     njit = None
@@ -92,10 +97,18 @@ if _numba_available():
         return comps
 
 class MultiIndex:
-    def __init__(self, r: int, n: int):
+    def __init__(
+        self,
+        r: int,
+        n: int,
+        show_progress: bool = True,
+        progress_desc: str = "MultiIndex",
+    ):
         self.dim = r
         self.max_order = n
         self._layers: List[List[Index]] = []
+        self._show_progress = bool(show_progress)
+        self._progress_desc = progress_desc
         self._generate()
 
     def _generate(self) -> None:
@@ -115,7 +128,11 @@ class MultiIndex:
         layer_set = {(0,) * r}
         self._layers.append(sorted(layer_set))
 
-        for _ in range(n):
+        it = range(n)
+        if self._show_progress and tqdm is not None and n > 1:
+            it = tqdm(it, desc=f"{self._progress_desc} layers", total=n)
+
+        for _ in it:
             next_set = set()
             for x in layer_set:
                 for i in range(r):
@@ -166,7 +183,12 @@ class MultiIndex:
         binom = _build_binom_table(max_n_pos)
 
         self._layers = []
-        for k_sum in range(n + 1):
+
+        it = range(n + 1)
+        if self._show_progress and tqdm is not None and n > 1:
+            it = tqdm(it, desc=f"{self._progress_desc} layers", total=n + 1)
+
+        for k_sum in it:
             out_count = int(math.comb(r + k_sum - 1, r - 1))
             comps = _weak_compositions_layer(k_sum, r, out_count, binom)
 
