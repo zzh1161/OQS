@@ -5,7 +5,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Tuple
 from tqdm import tqdm
 
-from numba import njit, prange
+try:
+    from numba import njit, prange  # type: ignore
+except Exception:  # pragma: no cover
+    njit = None
+    prange = range
 
 try:
     from ..utils.noise_generator import ColoredNoiseGenerator_Cholesky
@@ -41,6 +45,7 @@ if _numba_available():
         dt,
         z_n,
         Vcol,
+        Ucol,
         lam,
     ):
         """Compute one time step for all multi-indices <= n+1.
@@ -79,7 +84,7 @@ if _numba_available():
                         L_dag,
                         psi_prev[j_plus],
                         psi_curr[i],
-                        -dt * lam[k] * np.conj(Vcol[k]),
+                        -dt * lam[k] * Ucol[k],
                     )
 
 
@@ -96,6 +101,7 @@ if _numba_available():
         dt,
         z_n,
         Vcol,
+        Ucol,
         lam,
     ):
         """Serial variant used when trajectories are parallelized in Python."""
@@ -125,7 +131,7 @@ if _numba_available():
                         L_dag,
                         psi_prev[j_plus],
                         psi_curr[i],
-                        -dt * lam[k] * np.conj(Vcol[k]),
+                        -dt * lam[k] * Ucol[k],
                     )
 
 class NMLRSSE:
@@ -184,6 +190,7 @@ class NMLRSSE:
                 C[i,j] = self.bath_corr(self.t_grid[i]-self.t_grid[j])
         U, s, V = np.linalg.svd(C)
         self.V = V[:self.rank, :]
+        self.U = U[:, :self.rank]
         self.lam = s[:self.rank]
         dt = time.perf_counter() - t0
         return dt
@@ -217,7 +224,7 @@ class NMLRSSE:
                 self.psi_curr[idx] += self.dt*self.V[k,n]*self.L @ self.valid_psi(self.psi_prev, idx_minus)
             for k in range(self.rank):
                 idx_plus = idx[:k] + (idx[k]+1,) + idx[k+1:]
-                self.psi_curr[idx] -= self.dt*self.lam[k]*self.V[k,n].conj()*self.L_dag @ self.valid_psi(self.psi_prev, idx_plus)
+                self.psi_curr[idx] -= self.dt*self.lam[k]*self.U[n,k]*self.L_dag @ self.valid_psi(self.psi_prev, idx_plus)
 
     def _psi_step_numba_tables(self, prev_map: Dict[Tuple[int, ...], int], out_indices):
         """Build integer lookup tables for one step.
@@ -300,6 +307,7 @@ class NMLRSSE:
         L = np.ascontiguousarray(self.L, dtype=np.complex128)
         L_dag = np.ascontiguousarray(self.L_dag, dtype=np.complex128)
         V = np.ascontiguousarray(self.V, dtype=np.complex128)
+        U = np.ascontiguousarray(self.U, dtype=np.complex128)
         lam = np.ascontiguousarray(self.lam, dtype=np.float64)
         dt = float(self.dt)
 
@@ -334,6 +342,7 @@ class NMLRSSE:
                         dt,
                         z[n],
                         V[:, n],
+                        U[n, :],
                         lam,
                     )
 
@@ -371,6 +380,7 @@ class NMLRSSE:
                 dt,
                 Z[0, 0],
                 V[:, 0],
+                U[0, :],
                 lam,
             )
 
@@ -400,6 +410,7 @@ class NMLRSSE:
                     dt,
                     z_traj[n],
                     V[:, n],
+                    U[n, :],
                     lam,
                 )
 
