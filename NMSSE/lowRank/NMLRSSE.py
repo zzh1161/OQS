@@ -39,6 +39,7 @@ if _numba_available():
         same_idx,
         minus_idx,
         plus_idx,
+        idx_vals,
         Hs,
         L,
         L_dag,
@@ -74,7 +75,7 @@ if _numba_available():
                         L,
                         psi_prev[j_minus],
                         psi_curr[i],
-                        dt * Vcol[k]
+                        dt * idx_vals[i, k] * Vcol[k]
                     )
 
             for k in range(r):
@@ -95,6 +96,7 @@ if _numba_available():
         same_idx,
         minus_idx,
         plus_idx,
+        idx_vals,
         Hs,
         L,
         L_dag,
@@ -126,7 +128,7 @@ if _numba_available():
                         L,
                         psi_prev[j_minus],
                         psi_curr[i],
-                        dt * Vcol[k]
+                        dt * idx_vals[i, k] * Vcol[k]
                     )
 
             for k in range(r):
@@ -235,22 +237,24 @@ class NMLRSSE:
     def _psi_step_numba_tables(self, prev_map: Dict[Tuple[int, ...], int], out_indices):
         """Build integer lookup tables for one step.
 
-        Returns (same_idx, minus_idx, plus_idx) for use by the numba kernel.
+        Returns (same_idx, minus_idx, plus_idx, idx_vals) for use by the numba kernel.
         """
         M_out = len(out_indices)
         same_idx = np.empty(M_out, dtype=np.int64)
         minus_idx = np.empty((M_out, self.rank), dtype=np.int64)
         plus_idx = np.empty((M_out, self.rank), dtype=np.int64)
+        idx_vals = np.empty((M_out, self.rank), dtype=np.int64)
 
         for i, idx in enumerate(out_indices):
             same_idx[i] = prev_map.get(idx, -1)
             for k in range(self.rank):
+                idx_vals[i, k] = idx[k]
                 idx_minus = idx[:k] + (idx[k] - 1,) + idx[k + 1 :]
                 minus_idx[i, k] = prev_map.get(idx_minus, -1)
                 idx_plus = idx[:k] + (idx[k] + 1,) + idx[k + 1 :]
                 plus_idx[i, k] = prev_map.get(idx_plus, -1)
 
-        return same_idx, minus_idx, plus_idx
+        return same_idx, minus_idx, plus_idx, idx_vals
 
     def _prepare_numba_tables(self):
         """Precompute neighbor lookup tables for all steps.
@@ -273,12 +277,13 @@ class NMLRSSE:
             if n + 1 <= self.max_order:
                 new_layer = self.idx_set.layer(n + 1)
                 out_indices = prev_indices + new_layer
-                same_idx, minus_idx, plus_idx = self._psi_step_numba_tables(prev_map, out_indices)
+                same_idx, minus_idx, plus_idx, idx_vals = self._psi_step_numba_tables(prev_map, out_indices)
                 tables.append(
                     {
                         "same": same_idx,
                         "minus": minus_idx,
                         "plus": plus_idx,
+                        "idx_vals": idx_vals,
                         "out_len": len(out_indices),
                     }
                 )
@@ -290,11 +295,12 @@ class NMLRSSE:
             else:
                 if tail_table is None:
                     out_indices = prev_indices
-                    same_idx, minus_idx, plus_idx = self._psi_step_numba_tables(prev_map, out_indices)
+                    same_idx, minus_idx, plus_idx, idx_vals = self._psi_step_numba_tables(prev_map, out_indices)
                     tail_table = {
                         "same": same_idx,
                         "minus": minus_idx,
                         "plus": plus_idx,
+                        "idx_vals": idx_vals,
                         "out_len": len(out_indices),
                     }
                 tables.append(tail_table)
@@ -342,6 +348,7 @@ class NMLRSSE:
                         tab["same"],
                         tab["minus"],
                         tab["plus"],
+                        tab["idx_vals"],
                         Hs,
                         L,
                         L_dag,
@@ -380,6 +387,7 @@ class NMLRSSE:
                 tab0["same"],
                 tab0["minus"],
                 tab0["plus"],
+                tab0["idx_vals"],
                 Hs,
                 L,
                 L_dag,
@@ -410,6 +418,7 @@ class NMLRSSE:
                     tab["same"],
                     tab["minus"],
                     tab["plus"],
+                    tab["idx_vals"],
                     Hs,
                     L,
                     L_dag,
