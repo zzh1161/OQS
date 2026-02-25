@@ -122,7 +122,12 @@ if _numba_available():
             for k in range(r):
                 j_minus = minus_idx[i, k]
                 if j_minus != -1:
-                    _matvec_add_scaled(L, psi_prev[j_minus], psi_curr[i], dt * Vcol[k])
+                    _matvec_add_scaled(
+                        L,
+                        psi_prev[j_minus],
+                        psi_curr[i],
+                        dt * Vcol[k]
+                    )
 
             for k in range(r):
                 j_plus = plus_idx[i, k]
@@ -178,6 +183,7 @@ class NMLRSSE:
         self.psi_curr: Dict[Tuple[int, ...], np.ndarray] = {}
 
         self.idx_set = MultiIndex(r = self.rank, n = self.max_order)
+        self.idx_set.generate(order=1)
 
         time_cost= self.compute_low_rank_decomposition()
         print(f"Low-rank decomposition computed in {time_cost:.2f} seconds.")
@@ -221,7 +227,7 @@ class NMLRSSE:
             self.psi_curr[idx] = A @ self.valid_psi(self.psi_prev, idx)
             for k in range(self.rank):
                 idx_minus = idx[:k] + (idx[k]-1,) + idx[k+1:]
-                self.psi_curr[idx] += self.dt*self.V[k,n]*self.L @ self.valid_psi(self.psi_prev, idx_minus)
+                self.psi_curr[idx] += self.dt*idx[k]*self.V[k,n]*self.L @ self.valid_psi(self.psi_prev, idx_minus)
             for k in range(self.rank):
                 idx_plus = idx[:k] + (idx[k]+1,) + idx[k+1:]
                 self.psi_curr[idx] -= self.dt*self.lam[k]*self.U[n,k]*self.L_dag @ self.valid_psi(self.psi_prev, idx_plus)
