@@ -120,6 +120,7 @@ class NMLRSSE_forwardEuler:
         noise_generator = ColoredNoiseGenerator_Cholesky,
         max_order: int | None = None,
         do_low_rank_decomposition: bool = True,
+        noise_sample_Z: np.ndarray | None = None,
     ):
         self.dim = Hs.shape[0]
         self.Id = np.eye(self.dim)
@@ -131,6 +132,7 @@ class NMLRSSE_forwardEuler:
         self.tmax = tmax
         self.N_steps = N_steps
         self.rank = rank
+        self.noise_sample_Z = noise_sample_Z
         if max_order is None:
             self.max_order = int(N_steps)
         else:
@@ -314,10 +316,12 @@ class NMLRSSE_forwardEuler:
             max_workers = os.cpu_count() or 1
 
         # Pre-sample noises
-        Z = np.empty((N_traj, self.N_steps), dtype=np.complex128)
-        for traj in range(N_traj):
-            z = np.asarray(self.noise_generator.sample_process(), dtype=np.complex128)
-            Z[traj, :] = z[: self.N_steps]
+        Z = self.noise_sample_Z
+        if Z is None:
+            Z = np.empty((N_traj, self.N_steps), dtype=np.complex128)
+            for traj in range(N_traj):
+                z = np.asarray(self.noise_generator.sample_process(), dtype=np.complex128)
+                Z[traj, :] = z[: self.N_steps]
 
         # Trigger compilation
         if self.N_steps > 0:
