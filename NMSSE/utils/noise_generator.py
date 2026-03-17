@@ -48,7 +48,7 @@ class ColoredNoiseGenerator_Cholesky:
         # Hermitianize the correlation matrix
         correlations = 0.5 * (correlations + correlations.conj().T)
         # Add jitter to the diagonal for numerical stability
-        jitter = 1e-14 * np.eye(self.N_steps+1)
+        jitter = 1e-10 * np.eye(self.N_steps+1)
         correlations += jitter
 
         self.L = np.linalg.cholesky(correlations)

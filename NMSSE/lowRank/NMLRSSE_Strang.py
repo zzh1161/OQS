@@ -18,10 +18,21 @@ except ImportError:
     from utils.noise_generator import ColoredNoiseGenerator_Cholesky
     from utils.multi_index import MultiIndex
 
+
 def _numba_available() -> bool:
     return njit is not None
 
+
 if _numba_available():
+    @njit(cache=True, nogil=True)
+    def _matvec_into(A, x, out):
+        dim = A.shape[0]
+        for i in range(dim):
+            acc = 0.0 + 0.0j
+            for j in range(dim):
+                acc += A[i, j] * x[j]
+            out[i] = acc
+
     @njit(cache=True, nogil=True)
     def _matvec_add_scaled(A, x, y, scale):
         dim = A.shape[0]
@@ -32,10 +43,9 @@ if _numba_available():
             y[i] += scale * acc
 
     @njit(cache=True, nogil=True)
-    def _compute_rhs(
+    def _compute_rhs_ode(
         out,
         psi_in,
-        Hs,
         L,
         L_dag,
         z_step,
@@ -47,25 +57,21 @@ if _numba_available():
         idx_plus,
         state_idx,
     ):
-        """Compute RHS for a single hierarchy state."""
-        dim = Hs.shape[0]
+        dim = L.shape[0]
         rank = Vn.shape[0]
 
-        # Base term: -i*Hs*psi + z*L*psi
         for i in range(dim):
             acc = 0.0 + 0.0j
             for j in range(dim):
-                acc += (-1j * Hs[i, j] + z_step * L[i, j]) * psi_in[state_idx, j]
+                acc += (z_step * L[i, j]) * psi_in[state_idx, j]
             out[i] = acc
 
-        # Hierarchy coupling: downward (idx - 1)
         for k in range(rank):
             s_minus = idx_minus[state_idx, k]
             if s_minus >= 0:
                 scale = idx_values[state_idx, k] * Vn[k]
                 _matvec_add_scaled(L, psi_in[s_minus], out, scale)
 
-        # Hierarchy coupling: upward (idx + 1)
         for k in range(rank):
             s_plus = idx_plus[state_idx, k]
             if s_plus >= 0:
@@ -73,12 +79,13 @@ if _numba_available():
                 _matvec_add_scaled(L_dag, psi_in[s_plus], out, scale)
 
     @njit(parallel=True, cache=True, nogil=True)
-    def _psi_step_kernel(
+    def _strang_step_kernel(
         psi_prev,
         psi_curr,
+        psi_half,
         k1,
         psi_pred,
-        Hs,
+        P_half,
         L,
         L_dag,
         z_n,
@@ -93,15 +100,15 @@ if _numba_available():
         idx_minus,
         idx_plus,
     ):
-        """Heun method: parallel version."""
-        n_states = psi_prev.shape[0]
+        n_states, dim = psi_prev.shape
 
-        # Step 1: compute k1 = rhs(n, psi_prev)
         for s in prange(n_states):
-            _compute_rhs(
+            _matvec_into(P_half, psi_prev[s], psi_half[s])
+
+        for s in prange(n_states):
+            _compute_rhs_ode(
                 k1[s],
-                psi_prev,
-                Hs,
+                psi_half,
                 L,
                 L_dag,
                 z_n,
@@ -114,87 +121,14 @@ if _numba_available():
                 s,
             )
 
-        # Step 2: psi_pred = psi_prev + dt * k1
         for s in prange(n_states):
-            for i in range(psi_prev.shape[1]):
-                psi_pred[s, i] = psi_prev[s, i] + dt * k1[s, i]
+            for i in range(dim):
+                psi_pred[s, i] = psi_half[s, i] + dt * k1[s, i]
 
-        # Step 3: compute k2 = rhs(n+1, psi_pred)  (reuse k1 array for k2)
         for s in prange(n_states):
-            _compute_rhs(
-                psi_curr[s],  # use psi_curr as temp storage for k2
-                psi_pred,
-                Hs,
-                L,
-                L_dag,
-                z_n1,
-                Vn1,
-                Un1,
-                lam,
-                idx_values,
-                idx_minus,
-                idx_plus,
-                s,
-            )
-
-        # Step 4: psi_curr = psi_prev + 0.5 * dt * (k1 + k2)
-        for s in prange(n_states):
-            for i in range(psi_prev.shape[1]):
-                psi_curr[s, i] = psi_prev[s, i] + 0.5 * dt * (k1[s, i] + psi_curr[s, i])
-
-    @njit(cache=True, nogil=True)
-    def _psi_step_kernel_serial(
-        psi_prev,
-        psi_curr,
-        k1,
-        psi_pred,
-        Hs,
-        L,
-        L_dag,
-        z_n,
-        z_n1,
-        Vn,
-        Vn1,
-        Un,
-        Un1,
-        lam,
-        dt,
-        idx_values,
-        idx_minus,
-        idx_plus,
-    ):
-        """Heun method: serial version for trajectory-level parallelization."""
-        n_states = psi_prev.shape[0]
-
-        # Step 1: compute k1 = rhs(n, psi_prev)
-        for s in range(n_states):
-            _compute_rhs(
-                k1[s],
-                psi_prev,
-                Hs,
-                L,
-                L_dag,
-                z_n,
-                Vn,
-                Un,
-                lam,
-                idx_values,
-                idx_minus,
-                idx_plus,
-                s,
-            )
-
-        # Step 2: psi_pred = psi_prev + dt * k1
-        for s in range(n_states):
-            for i in range(psi_prev.shape[1]):
-                psi_pred[s, i] = psi_prev[s, i] + dt * k1[s, i]
-
-        # Step 3: compute k2 = rhs(n+1, psi_pred)
-        for s in range(n_states):
-            _compute_rhs(
+            _compute_rhs_ode(
                 psi_curr[s],
                 psi_pred,
-                Hs,
                 L,
                 L_dag,
                 z_n1,
@@ -207,14 +141,93 @@ if _numba_available():
                 s,
             )
 
-        # Step 4: psi_curr = psi_prev + 0.5 * dt * (k1 + k2)
+        for s in prange(n_states):
+            for i in range(dim):
+                psi_curr[s, i] = psi_half[s, i] + 0.5 * dt * (k1[s, i] + psi_curr[s, i])
+
+        for s in prange(n_states):
+            _matvec_into(P_half, psi_curr[s], psi_half[s])
+
+        for s in prange(n_states):
+            for i in range(dim):
+                psi_curr[s, i] = psi_half[s, i]
+
+    @njit(cache=True, nogil=True)
+    def _strang_step_kernel_serial(
+        psi_prev,
+        psi_curr,
+        psi_half,
+        k1,
+        psi_pred,
+        P_half,
+        L,
+        L_dag,
+        z_n,
+        z_n1,
+        Vn,
+        Vn1,
+        Un,
+        Un1,
+        lam,
+        dt,
+        idx_values,
+        idx_minus,
+        idx_plus,
+    ):
+        n_states, dim = psi_prev.shape
+
         for s in range(n_states):
-            for i in range(psi_prev.shape[1]):
-                psi_curr[s, i] = psi_prev[s, i] + 0.5 * dt * (k1[s, i] + psi_curr[s, i])
+            _matvec_into(P_half, psi_prev[s], psi_half[s])
+
+        for s in range(n_states):
+            _compute_rhs_ode(
+                k1[s],
+                psi_half,
+                L,
+                L_dag,
+                z_n,
+                Vn,
+                Un,
+                lam,
+                idx_values,
+                idx_minus,
+                idx_plus,
+                s,
+            )
+
+        for s in range(n_states):
+            for i in range(dim):
+                psi_pred[s, i] = psi_half[s, i] + dt * k1[s, i]
+
+        for s in range(n_states):
+            _compute_rhs_ode(
+                psi_curr[s],
+                psi_pred,
+                L,
+                L_dag,
+                z_n1,
+                Vn1,
+                Un1,
+                lam,
+                idx_values,
+                idx_minus,
+                idx_plus,
+                s,
+            )
+
+        for s in range(n_states):
+            for i in range(dim):
+                psi_curr[s, i] = psi_half[s, i] + 0.5 * dt * (k1[s, i] + psi_curr[s, i])
+
+        for s in range(n_states):
+            _matvec_into(P_half, psi_curr[s], psi_half[s])
+
+        for s in range(n_states):
+            for i in range(dim):
+                psi_curr[s, i] = psi_half[s, i]
 
 
-
-class NMLRSSE_Heun:
+class NMLRSSE_Strang:
     def __init__(
         self,
         Hs,
@@ -223,7 +236,7 @@ class NMLRSSE_Heun:
         tmax,
         N_steps,
         rank,
-        noise_generator = ColoredNoiseGenerator_Cholesky,
+        noise_generator=ColoredNoiseGenerator_Cholesky,
         max_layer: int | None = None,
         do_low_rank_decomposition: bool = True,
         noise_sample_Z: np.ndarray | None = None,
@@ -232,6 +245,9 @@ class NMLRSSE_Heun:
         self.Id = np.eye(self.dim)
         self._zero_state = np.zeros(self.dim, dtype=complex)
         self.Hs = Hs
+        self.Hs_E, self.Hs_V = np.linalg.eigh(Hs)
+        self.Hs_V_dag = self.Hs_V.conj().T
+        self.Hs_propagator = lambda t: self.Hs_V @ np.diag(np.exp(-1j * self.Hs_E * t)) @ self.Hs_V_dag
         self.L = L
         self.L_dag = L.conj().T
         self.bath_corr = bath_corr
@@ -247,18 +263,18 @@ class NMLRSSE_Heun:
             raise ValueError("max_layer must be non-negative")
         if self.max_layer > self.N_steps:
             self.max_layer = int(self.N_steps)
-        
-        self.dt = tmax / N_steps
-        self.t_grid = np.linspace(0, tmax, N_steps+1)
 
-        self.noise_generator = noise_generator(
-            bath_corr, tmax, N_steps
-        )
+        self.dt = tmax / N_steps
+        self.t_grid = np.linspace(0, tmax, N_steps + 1)
+        self.P_half = self.Hs_propagator(0.5 * self.dt)
+
+        self.noise_generator = noise_generator(bath_corr, tmax, N_steps)
 
         self.psi_prev: Dict[Tuple[int, ...], np.ndarray] = {}
         self.psi_curr: Dict[Tuple[int, ...], np.ndarray] = {}
-        self.idx_set = MultiIndex(r = self.rank, n = self.max_layer)
-        self.idx_set.generate(order = 1)
+
+        self.idx_set = MultiIndex(r=self.rank, n=self.max_layer)
+        self.idx_set.generate(order=1)
         self.idx_map: Dict[Tuple[int, ...], int] = {}
         self.initialize_index_map()
         self.initialize_psi()
@@ -272,7 +288,6 @@ class NMLRSSE_Heun:
             timecost = self.compute_low_rank_decomposition()
             print(f"Low-rank decomposition done in {timecost:.2f} seconds.")
 
-
     def initialize_index_map(self):
         number = 0
         for k in range(self.max_layer + 1):
@@ -280,30 +295,34 @@ class NMLRSSE_Heun:
                 self.idx_map[idx] = number
                 number += 1
         return len(self.idx_map) == len(self.idx_set)
-    
+
     def initialize_psi(self):
         for idx in self.idx_set:
             self.psi_prev[idx] = self._zero_state.copy()
-
-    def set_SVD(self, lam, U, V):
-        self.lam = lam
-        self.U = U
-        self.V = V
-            
+            self.psi_curr[idx] = self._zero_state.copy()
 
     def compute_low_rank_decomposition(self):
         t0 = time.perf_counter()
         C = np.empty((self.N_steps + 1, self.N_steps + 1), dtype=complex)
         for i in range(self.N_steps + 1):
             for j in range(self.N_steps + 1):
-                C[i, j] = self.dt * self.bath_corr(self.t_grid[i] - self.t_grid[j])
-        U, s, V = np.linalg.svd(C)
-        self.V = V[: self.rank, :] / np.sqrt(self.dt)
-        self.U = U[:, : self.rank] / np.sqrt(self.dt)
+                C[i, j] = self.bath_corr(self.t_grid[i] - self.t_grid[j])
+        diag_weight = np.sqrt(self.dt) * np.ones(self.N_steps + 1)
+        diag_weight[0] = np.sqrt(0.5 * self.dt)
+        diag_weight[-1] = np.sqrt(0.5 * self.dt)
+        W_half = np.diag(diag_weight)
+        W_half_inv = np.diag(1.0 / diag_weight)
+        U, s, V = np.linalg.svd(W_half @ C @ W_half)
+        self.V = V[: self.rank, :] @ W_half_inv
+        self.U = W_half_inv @ U[:, : self.rank]
         self.lam = s[: self.rank]
         dt = time.perf_counter() - t0
         return dt
-    
+
+    def set_SVD(self, lam, U, V):
+        self.lam = lam
+        self.U = U
+        self.V = V
 
     def _build_numba_indexing(self):
         n_states = len(self.idx_set)
@@ -315,71 +334,76 @@ class NMLRSSE_Heun:
             idx_values[pos, :] = np.array(idx, dtype=np.int64)
             for k in range(self.rank):
                 if idx[k] > 0:
-                    idx_m = idx[:k] + (idx[k]-1,) + idx[k+1:]
+                    idx_m = idx[:k] + (idx[k] - 1,) + idx[k + 1 :]
                     idx_minus[pos, k] = self.idx_map.get(idx_m, -1)
-                idx_p = idx[:k] + (idx[k]+1,) + idx[k+1:]
+                idx_p = idx[:k] + (idx[k] + 1,) + idx[k + 1 :]
                 idx_plus[pos, k] = self.idx_map.get(idx_p, -1)
 
         self._numba_idx_values = idx_values
         self._numba_idx_minus = idx_minus
         self._numba_idx_plus = idx_plus
 
+    def valid_psi(self, psi: Dict[Tuple[int, ...], np.ndarray], idx: Tuple[int, ...]) -> np.ndarray:
+        return psi.get(idx, self._zero_state)
 
-    def psi_step(self, z, n):
-        if n < 0 or n >= self.N_steps:
-            raise ValueError(f"n must satisfy 0 <= n < N_steps (got n={n})")
-        
-        def valid_psi(psi: Dict[Tuple[int, ...], np.ndarray], idx: Tuple[int, ...]) -> np.ndarray:
-            return psi.get(idx, self._zero_state)
-        
-        def _rhs(step: int, psi: Dict[Tuple[int, ...], np.ndarray], idx: Tuple[int, ...]) -> np.ndarray:
-            base = valid_psi(psi, idx)
-            acc = (-1j) * (self.Hs @ base) + z[step] * (self.L @ base)
-            for k in range(self.rank):
-                idx_minus = idx[:k] + (idx[k] - 1,) + idx[k + 1 :]
-                acc = acc + idx[k] * self.V[k, step] * (self.L @ valid_psi(psi, idx_minus))
-            for k in range(self.rank):
-                idx_plus = idx[:k] + (idx[k] + 1,) + idx[k + 1 :]
-                acc = acc - (self.lam[k] * self.U[step, k]) * (self.L_dag @ valid_psi(psi, idx_plus))
-            return acc
-        
+    def ode_rhs(
+        self,
+        z: np.ndarray,
+        step: int,
+        psi: Dict[Tuple[int, ...], np.ndarray],
+        idx: Tuple[int, ...],
+    ) -> np.ndarray:
+        base = self.valid_psi(psi, idx)
+        acc = z[step] * (self.L @ base)
+        for k in range(self.rank):
+            idx_minus = idx[:k] + (idx[k] - 1,) + idx[k + 1 :]
+            acc = acc + idx[k] * self.V[k, step] * (self.L @ self.valid_psi(psi, idx_minus))
+        for k in range(self.rank):
+            idx_plus = idx[:k] + (idx[k] + 1,) + idx[k + 1 :]
+            acc = acc - (self.lam[k] * self.U[step, k]) * (self.L_dag @ self.valid_psi(psi, idx_plus))
+        return acc
+
+    def ode_step(
+        self,
+        psi_in: Dict[Tuple[int, ...], np.ndarray],
+        psi_out: Dict[Tuple[int, ...], np.ndarray],
+        z: np.ndarray,
+        step: int,
+        dt: float,
+    ):
         k1: Dict[Tuple[int, ...], np.ndarray] = {}
         psi_pred: Dict[Tuple[int, ...], np.ndarray] = {}
 
         for idx in self.idx_set:
-            psi_n = valid_psi(self.psi_prev, idx)
-            k1_idx = _rhs(n, self.psi_prev, idx)
+            psi_n = self.valid_psi(psi_in, idx)
+            k1_idx = self.ode_rhs(z, step, psi_in, idx)
             k1[idx] = k1_idx
-            psi_pred[idx] = psi_n + self.dt * k1_idx
+            psi_pred[idx] = psi_n + dt * k1_idx
 
         for idx in self.idx_set:
-            psi_n = valid_psi(self.psi_prev, idx)
-            k2_idx = _rhs(n + 1, psi_pred, idx)
-            self.psi_curr[idx] = psi_n + 0.5 * self.dt * (k1[idx] + k2_idx)
+            psi_n = self.valid_psi(psi_in, idx)
+            k2_idx = self.ode_rhs(z, step + 1, psi_pred, idx)
+            psi_out[idx] = psi_n + 0.5 * dt * (k1[idx] + k2_idx)
 
+    def exp_step(self, psi: Dict[Tuple[int, ...], np.ndarray], dt: float):
+        H_prop = self.Hs_propagator(dt)
+        for idx in self.idx_set:
+            psi[idx] = H_prop @ psi[idx]
 
-    def solve_python(self, N_traj, psi0):
+    def solve_python(self, N_traj: int, psi0: np.ndarray):
         self.initialize_psi()
-        self.psi_curr.clear()
-
-        psis = np.zeros((N_traj, self.N_steps+1, self.dim), dtype=complex)
+        psis = np.zeros((N_traj, self.N_steps + 1, self.dim), dtype=complex)
         psis[:, 0, :] = psi0
 
         for traj in tqdm(range(N_traj), desc="Trajectories"):
-            if self.noise_sample_Z is None:
-                z = self.noise_generator.sample_process()
-            else:
-                z = self.noise_sample_Z[traj, :]
+            z = self.noise_sample_Z[traj, :] if self.noise_sample_Z is not None else self.noise_generator.sample_process()
             self.psi_prev[(0,) * self.rank] = psi0.copy()
-            for n in tqdm(
-                range(1, self.N_steps + 1),
-                desc="Steps",
-                leave=False,
-            ):
-                self.psi_step(z, n - 1)
-                psis[traj, n, :] = self.psi_curr[(0,) * self.rank]
+            for step in range(self.N_steps):
+                self.exp_step(self.psi_prev, 0.5 * self.dt)
+                self.ode_step(self.psi_prev, self.psi_curr, z, step, self.dt)
+                self.exp_step(self.psi_curr, 0.5 * self.dt)
+                psis[traj, step + 1, :] = self.psi_curr[(0,) * self.rank]
                 self.psi_prev, self.psi_curr = self.psi_curr, self.psi_prev
-                self.psi_curr.clear()
 
         return psis
 
@@ -390,7 +414,7 @@ class NMLRSSE_Heun:
         if self._numba_idx_values is None:
             self._build_numba_indexing()
 
-        Hs = np.ascontiguousarray(self.Hs, dtype=np.complex128)
+        P_half = np.ascontiguousarray(self.P_half, dtype=np.complex128)
         L = np.ascontiguousarray(self.L, dtype=np.complex128)
         L_dag = np.ascontiguousarray(self.L_dag, dtype=np.complex128)
         V = np.ascontiguousarray(self.V, dtype=np.complex128)
@@ -404,9 +428,9 @@ class NMLRSSE_Heun:
         psis[:, 0, :] = np.asarray(psi0, dtype=np.complex128)
 
         if not parallel_traj:
-            # Non-parallel trajectory mode
             psi_prev = np.zeros((n_states, self.dim), dtype=np.complex128)
             psi_curr = np.zeros((n_states, self.dim), dtype=np.complex128)
+            psi_half = np.zeros((n_states, self.dim), dtype=np.complex128)
             k1 = np.zeros((n_states, self.dim), dtype=np.complex128)
             psi_pred = np.zeros((n_states, self.dim), dtype=np.complex128)
 
@@ -415,17 +439,21 @@ class NMLRSSE_Heun:
                     z = np.asarray(self.noise_generator.sample_process(), dtype=np.complex128)
                 else:
                     z = np.asarray(self.noise_sample_Z[traj, :], dtype=np.complex128)
-                
+
+                if z.shape[0] < N:
+                    raise ValueError(f"noise length must be at least N_steps+1={N}, got {z.shape[0]}")
+
                 psi_prev[:, :] = 0.0
                 psi_prev[self._zero_idx, :] = psis[traj, 0, :]
 
-                for n in tqdm(range(self.N_steps), desc="Steps", leave=False):
-                    _psi_step_kernel(
+                for n in range(self.N_steps):
+                    _strang_step_kernel(
                         psi_prev,
                         psi_curr,
+                        psi_half,
                         k1,
                         psi_pred,
-                        Hs,
+                        P_half,
                         L,
                         L_dag,
                         z[n],
@@ -446,30 +474,36 @@ class NMLRSSE_Heun:
 
             return psis
 
-        # Trajectory-parallel mode
         if max_workers is None:
             max_workers = os.cpu_count() or 1
 
-        # Pre-sample noises
         Z = self.noise_sample_Z
         if Z is None:
             Z = np.empty((N_traj, N), dtype=np.complex128)
             for traj in range(N_traj):
                 z = np.asarray(self.noise_generator.sample_process(), dtype=np.complex128)
-                Z[traj, :] = z
+                if z.shape[0] < N:
+                    raise ValueError(f"noise length must be at least N_steps+1={N}, got {z.shape[0]}")
+                Z[traj, :] = z[:N]
+        else:
+            Z = np.asarray(Z, dtype=np.complex128)
+            if Z.shape[1] < N:
+                raise ValueError(f"noise_sample_Z second dimension must be at least N_steps+1={N}, got {Z.shape[1]}")
 
-        # Trigger compilation
         if self.N_steps > 0:
             _psi_prev0 = np.zeros((n_states, self.dim), dtype=np.complex128)
             _psi_curr0 = np.zeros((n_states, self.dim), dtype=np.complex128)
-            _k1_0 = np.zeros((n_states, self.dim), dtype=np.complex128)
+            _psi_half0 = np.zeros((n_states, self.dim), dtype=np.complex128)
+            _k10 = np.zeros((n_states, self.dim), dtype=np.complex128)
             _psi_pred0 = np.zeros((n_states, self.dim), dtype=np.complex128)
-            _psi_step_kernel_serial(
+
+            _strang_step_kernel_serial(
                 _psi_prev0,
                 _psi_curr0,
-                _k1_0,
+                _psi_half0,
+                _k10,
                 _psi_pred0,
-                Hs,
+                P_half,
                 L,
                 L_dag,
                 Z[0, 0],
@@ -493,18 +527,20 @@ class NMLRSSE_Heun:
 
             psi_prev = np.zeros((n_states, self.dim), dtype=np.complex128)
             psi_curr = np.zeros((n_states, self.dim), dtype=np.complex128)
+            psi_half = np.zeros((n_states, self.dim), dtype=np.complex128)
             k1 = np.zeros((n_states, self.dim), dtype=np.complex128)
             psi_pred = np.zeros((n_states, self.dim), dtype=np.complex128)
             psi_prev[self._zero_idx, :] = psi0_arr
 
             z_traj = Z[traj]
             for n in range(self.N_steps):
-                _psi_step_kernel_serial(
+                _strang_step_kernel_serial(
                     psi_prev,
                     psi_curr,
+                    psi_half,
                     k1,
                     psi_pred,
-                    Hs,
+                    P_half,
                     L,
                     L_dag,
                     z_traj[n],
@@ -534,13 +570,13 @@ class NMLRSSE_Heun:
         return psis
 
     def solve(
-            self, 
-            N_traj,
-            psi0,
-            backend: str = "auto",
-            parallel_traj: bool = False,
-            max_workers: int | None = None,
-        ):
+        self,
+        N_traj,
+        psi0,
+        backend: str = "auto",
+        parallel_traj: bool = False,
+        max_workers: int | None = None,
+    ):
         if backend not in ("auto", "python", "numba"):
             raise ValueError("backend must be one of: 'auto', 'python', 'numba'")
 
