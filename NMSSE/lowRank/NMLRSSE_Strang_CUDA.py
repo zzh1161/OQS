@@ -101,7 +101,7 @@ if _numba_gpu_available():
             out[s, i] = base[s, i] + 0.5 * dt * (k1[s, i] + k2[s, i])
 
 
-class NMLRSSE_Strang_GPU:
+class NMLRSSE_Strang_CUDA:
     def __init__(
         self,
         Hs,
