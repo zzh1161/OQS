@@ -36,69 +36,148 @@ def _numba_gpu_available() -> bool:
 
 if _numba_gpu_available():
     @cuda.jit
-    def _gpu_matmul_states(A, X, Y):
-        s, i = cuda.grid(2)
-        n_states = X.shape[0]
+    def _gpu_matmul_states_batched(A, X, Y):
+        bs, i = cuda.grid(2)
+        n_batch = X.shape[0]
+        n_states = X.shape[1]
         dim = A.shape[0]
-        if s < n_states and i < dim:
+        total_states = n_batch * n_states
+        if bs < total_states and i < dim:
+            b = bs // n_states
+            s = bs - b * n_states
             acc = 0.0 + 0.0j
             for j in range(dim):
-                acc += A[i, j] * X[s, j]
-            Y[s, i] = acc
+                acc += A[i, j] * X[b, s, j]
+            Y[b, s, i] = acc
 
     @cuda.jit
-    def _gpu_rhs_kernel(
-        out,
+    def _gpu_rhs_predict_kernel(
+        out_k1,
+        out_pred,
         psi_in,
+        z,
         L,
         L_dag,
-        z_step,
         V,
         U,
         lam,
         step,
-        idx_values,
-        idx_minus,
-        idx_plus,
+        dt,
+        minus_count,
+        minus_k,
+        minus_state,
+        minus_value,
+        plus_count,
+        plus_k,
+        plus_state,
     ):
-        s, i = cuda.grid(2)
-        n_states = psi_in.shape[0]
+        bs, i = cuda.grid(2)
+        n_batch = psi_in.shape[0]
+        n_states = psi_in.shape[1]
         dim = L.shape[0]
-        if s < n_states and i < dim:
+        total_states = n_batch * n_states
+        if bs < total_states and i < dim:
+            b = bs // n_states
+            s = bs - b * n_states
+            z_step = z[b, step]
             acc = 0.0 + 0.0j
             for j in range(dim):
-                acc += (z_step * L[i, j]) * psi_in[s, j]
+                acc += (z_step * L[i, j]) * psi_in[b, s, j]
 
-            rank = lam.shape[0]
-            for k in range(rank):
-                s_minus = idx_minus[s, k]
-                if s_minus >= 0:
-                    scale_minus = idx_values[s, k] * V[k, step]
-                    for j in range(dim):
-                        acc += scale_minus * L[i, j] * psi_in[s_minus, j]
+            m_count = minus_count[s]
+            for m in range(m_count):
+                k = minus_k[s, m]
+                s_minus = minus_state[s, m]
+                scale_minus = minus_value[s, m] * V[k, step]
+                for j in range(dim):
+                    acc += scale_minus * L[i, j] * psi_in[b, s_minus, j]
 
-            for k in range(rank):
-                s_plus = idx_plus[s, k]
-                if s_plus >= 0:
-                    scale_plus = -lam[k] * U[step, k]
-                    for j in range(dim):
-                        acc += scale_plus * L_dag[i, j] * psi_in[s_plus, j]
+            p_count = plus_count[s]
+            for m in range(p_count):
+                k = plus_k[s, m]
+                s_plus = plus_state[s, m]
+                scale_plus = -lam[k] * U[step, k]
+                for j in range(dim):
+                    acc += scale_plus * L_dag[i, j] * psi_in[b, s_plus, j]
 
-            out[s, i] = acc
-
-    @cuda.jit
-    def _gpu_linear2_kernel(out, x, y, ax, ay):
-        s, i = cuda.grid(2)
-        n_states, dim = out.shape
-        if s < n_states and i < dim:
-            out[s, i] = ax * x[s, i] + ay * y[s, i]
+            out_k1[b, s, i] = acc
+            out_pred[b, s, i] = psi_in[b, s, i] + dt * acc
 
     @cuda.jit
-    def _gpu_heun_combine_kernel(out, base, k1, k2, dt):
-        s, i = cuda.grid(2)
-        n_states, dim = out.shape
-        if s < n_states and i < dim:
-            out[s, i] = base[s, i] + 0.5 * dt * (k1[s, i] + k2[s, i])
+    def _gpu_rhs_heun_kernel(
+        out,
+        base,
+        k1,
+        psi_pred,
+        z,
+        L,
+        L_dag,
+        V,
+        U,
+        lam,
+        step,
+        dt,
+        minus_count,
+        minus_k,
+        minus_state,
+        minus_value,
+        plus_count,
+        plus_k,
+        plus_state,
+    ):
+        bs, i = cuda.grid(2)
+        n_batch = psi_pred.shape[0]
+        n_states = psi_pred.shape[1]
+        dim = L.shape[0]
+        total_states = n_batch * n_states
+        if bs < total_states and i < dim:
+            b = bs // n_states
+            s = bs - b * n_states
+            z_step = z[b, step]
+            acc = 0.0 + 0.0j
+            for j in range(dim):
+                acc += (z_step * L[i, j]) * psi_pred[b, s, j]
+
+            m_count = minus_count[s]
+            for m in range(m_count):
+                k = minus_k[s, m]
+                s_minus = minus_state[s, m]
+                scale_minus = minus_value[s, m] * V[k, step]
+                for j in range(dim):
+                    acc += scale_minus * L[i, j] * psi_pred[b, s_minus, j]
+
+            p_count = plus_count[s]
+            for m in range(p_count):
+                k = plus_k[s, m]
+                s_plus = plus_state[s, m]
+                scale_plus = -lam[k] * U[step, k]
+                for j in range(dim):
+                    acc += scale_plus * L_dag[i, j] * psi_pred[b, s_plus, j]
+
+            out[b, s, i] = base[b, s, i] + 0.5 * dt * (k1[b, s, i] + acc)
+
+    @cuda.jit
+    def _gpu_store_zero_state_kernel(out_hist, states, zero_idx, step):
+        b, i = cuda.grid(2)
+        n_batch = states.shape[0]
+        dim = states.shape[2]
+        if b < n_batch and i < dim:
+            out_hist[b, step, i] = states[b, zero_idx, i]
+
+    @cuda.jit
+    def _gpu_reset_states_kernel(states, zero_idx, psi0):
+        bs, i = cuda.grid(2)
+        n_batch = states.shape[0]
+        n_states = states.shape[1]
+        dim = states.shape[2]
+        total_states = n_batch * n_states
+        if bs < total_states and i < dim:
+            b = bs // n_states
+            s = bs - b * n_states
+            if s == zero_idx:
+                states[b, s, i] = psi0[i]
+            else:
+                states[b, s, i] = 0.0 + 0.0j
 
 
 class NMLRSSE_Strang_CUDA:
@@ -153,10 +232,16 @@ class NMLRSSE_Strang_CUDA:
         self.initialize_index_map()
         self.initialize_psi()
 
-        self._numba_idx_values = None
-        self._numba_idx_minus = None
-        self._numba_idx_plus = None
+        self._numba_minus_count = None
+        self._numba_minus_k = None
+        self._numba_minus_state = None
+        self._numba_minus_value = None
+        self._numba_plus_count = None
+        self._numba_plus_k = None
+        self._numba_plus_state = None
         self._zero_idx = self.idx_map[(0,) * self.rank]
+
+        self._gpu_const_cache = None
 
         if do_low_rank_decomposition:
             timecost = self.compute_low_rank_decomposition()
@@ -196,22 +281,79 @@ class NMLRSSE_Strang_CUDA:
 
     def _build_numba_indexing(self):
         n_states = len(self.idx_set)
-        idx_values = np.empty((n_states, self.rank), dtype=np.int64)
-        idx_minus = -np.ones((n_states, self.rank), dtype=np.int64)
-        idx_plus = -np.ones((n_states, self.rank), dtype=np.int64)
+        minus_count = np.zeros(n_states, dtype=np.int32)
+        minus_k = np.zeros((n_states, self.rank), dtype=np.int32)
+        minus_state = np.zeros((n_states, self.rank), dtype=np.int32)
+        minus_value = np.zeros((n_states, self.rank), dtype=np.float64)
+
+        plus_count = np.zeros(n_states, dtype=np.int32)
+        plus_k = np.zeros((n_states, self.rank), dtype=np.int32)
+        plus_state = np.zeros((n_states, self.rank), dtype=np.int32)
 
         for idx, pos in self.idx_map.items():
-            idx_values[pos, :] = np.array(idx, dtype=np.int64)
+            m = 0
+            p = 0
             for k in range(self.rank):
                 if idx[k] > 0:
                     idx_m = idx[:k] + (idx[k] - 1,) + idx[k + 1 :]
-                    idx_minus[pos, k] = self.idx_map.get(idx_m, -1)
+                    s_minus = self.idx_map.get(idx_m, -1)
+                    if s_minus >= 0:
+                        minus_k[pos, m] = k
+                        minus_state[pos, m] = s_minus
+                        minus_value[pos, m] = float(idx[k])
+                        m += 1
                 idx_p = idx[:k] + (idx[k] + 1,) + idx[k + 1 :]
-                idx_plus[pos, k] = self.idx_map.get(idx_p, -1)
+                s_plus = self.idx_map.get(idx_p, -1)
+                if s_plus >= 0:
+                    plus_k[pos, p] = k
+                    plus_state[pos, p] = s_plus
+                    p += 1
+            minus_count[pos] = m
+            plus_count[pos] = p
 
-        self._numba_idx_values = idx_values
-        self._numba_idx_minus = idx_minus
-        self._numba_idx_plus = idx_plus
+        self._numba_minus_count = minus_count
+        self._numba_minus_k = minus_k
+        self._numba_minus_state = minus_state
+        self._numba_minus_value = minus_value
+        self._numba_plus_count = plus_count
+        self._numba_plus_k = plus_k
+        self._numba_plus_state = plus_state
+
+    def _ensure_gpu_constants(self):
+        if self._gpu_const_cache is not None:
+            return self._gpu_const_cache
+
+        P_half = np.ascontiguousarray(self.P_half, dtype=np.complex128)
+        L = np.ascontiguousarray(self.L, dtype=np.complex128)
+        L_dag = np.ascontiguousarray(self.L_dag, dtype=np.complex128)
+        V = np.ascontiguousarray(self.V, dtype=np.complex128)
+        U = np.ascontiguousarray(self.U, dtype=np.complex128)
+        lam = np.ascontiguousarray(self.lam, dtype=np.float64)
+
+        minus_count = np.ascontiguousarray(self._numba_minus_count, dtype=np.int32)
+        minus_k = np.ascontiguousarray(self._numba_minus_k, dtype=np.int32)
+        minus_state = np.ascontiguousarray(self._numba_minus_state, dtype=np.int32)
+        minus_value = np.ascontiguousarray(self._numba_minus_value, dtype=np.float64)
+        plus_count = np.ascontiguousarray(self._numba_plus_count, dtype=np.int32)
+        plus_k = np.ascontiguousarray(self._numba_plus_k, dtype=np.int32)
+        plus_state = np.ascontiguousarray(self._numba_plus_state, dtype=np.int32)
+
+        self._gpu_const_cache = {
+            "d_P_half": cuda.to_device(P_half),
+            "d_L": cuda.to_device(L),
+            "d_L_dag": cuda.to_device(L_dag),
+            "d_V": cuda.to_device(V),
+            "d_U": cuda.to_device(U),
+            "d_lam": cuda.to_device(lam),
+            "d_minus_count": cuda.to_device(minus_count),
+            "d_minus_k": cuda.to_device(minus_k),
+            "d_minus_state": cuda.to_device(minus_state),
+            "d_minus_value": cuda.to_device(minus_value),
+            "d_plus_count": cuda.to_device(plus_count),
+            "d_plus_k": cuda.to_device(plus_k),
+            "d_plus_state": cuda.to_device(plus_state),
+        }
+        return self._gpu_const_cache
     
 
     def valid_psi(self, psi: Dict[Tuple[int, ...], np.ndarray], idx: Tuple[int, ...]) -> np.ndarray:
@@ -278,23 +420,20 @@ class NMLRSSE_Strang_CUDA:
 
         return psis
 
-    def solve_numba_gpu(self, N_traj: int, psi0: np.ndarray, threadsperblock: tuple[int, int] = (16, 8)):
+    def solve_numba_gpu(
+        self,
+        N_traj: int,
+        psi0: np.ndarray,
+        threadsperblock: tuple[int, int] = (128, 4),
+        traj_batch_size: int = 64,
+    ):
         if not _numba_gpu_available():
             raise RuntimeError("numba cuda is not available")
 
-        if self._numba_idx_values is None:
+        if self._numba_minus_count is None:
             self._build_numba_indexing()
 
-        P_half = np.ascontiguousarray(self.P_half, dtype=np.complex128)
-        L = np.ascontiguousarray(self.L, dtype=np.complex128)
-        L_dag = np.ascontiguousarray(self.L_dag, dtype=np.complex128)
-        V = np.ascontiguousarray(self.V, dtype=np.complex128)
-        U = np.ascontiguousarray(self.U, dtype=np.complex128)
-        lam = np.ascontiguousarray(self.lam, dtype=np.float64)
-
-        idx_values = np.ascontiguousarray(self._numba_idx_values, dtype=np.int64)
-        idx_minus = np.ascontiguousarray(self._numba_idx_minus, dtype=np.int64)
-        idx_plus = np.ascontiguousarray(self._numba_idx_plus, dtype=np.int64)
+        gpu_const = self._ensure_gpu_constants()
 
         n_states = len(self.idx_set)
         N = self.N_steps + 1
@@ -304,94 +443,139 @@ class NMLRSSE_Strang_CUDA:
         psis = np.zeros((N_traj, N, self.dim), dtype=np.complex128)
         psis[:, 0, :] = psi0_arr
 
-        d_P_half = cuda.to_device(P_half)
-        d_L = cuda.to_device(L)
-        d_L_dag = cuda.to_device(L_dag)
-        d_V = cuda.to_device(V)
-        d_U = cuda.to_device(U)
-        d_lam = cuda.to_device(lam)
-        d_idx_values = cuda.to_device(idx_values)
-        d_idx_minus = cuda.to_device(idx_minus)
-        d_idx_plus = cuda.to_device(idx_plus)
-
-        d_prev = cuda.device_array((n_states, self.dim), dtype=np.complex128)
-        d_half = cuda.device_array((n_states, self.dim), dtype=np.complex128)
-        d_curr = cuda.device_array((n_states, self.dim), dtype=np.complex128)
-        d_k1 = cuda.device_array((n_states, self.dim), dtype=np.complex128)
-        d_pred = cuda.device_array((n_states, self.dim), dtype=np.complex128)
-
         tx, ty = threadsperblock
-        blockspergrid = ((n_states + tx - 1) // tx, (self.dim + ty - 1) // ty)
+        if traj_batch_size <= 0:
+            raise ValueError("traj_batch_size must be positive")
+        if tx <= 0 or ty <= 0 or tx * ty > 1024:
+            raise ValueError("threadsperblock must be positive and tx*ty <= 1024")
 
-        host_state = np.zeros((n_states, self.dim), dtype=np.complex128)
-        host_zero = np.empty(self.dim, dtype=np.complex128)
-
-        for traj in tqdm(range(N_traj), desc="Trajectories"):
-            if self.noise_sample_Z is None:
+        if self.noise_sample_Z is None:
+            Z = np.empty((N_traj, N), dtype=np.complex128)
+            for traj in range(N_traj):
                 z = np.asarray(self.noise_generator.sample_process(), dtype=np.complex128)
-            else:
-                z = np.asarray(self.noise_sample_Z[traj, :], dtype=np.complex128)
+                if z.shape[0] < N:
+                    raise ValueError(f"noise length must be at least N_steps+1={N}, got {z.shape[0]}")
+                Z[traj, :] = z[:N]
+        else:
+            Z = np.asarray(self.noise_sample_Z, dtype=np.complex128)
+            if Z.shape[0] < N_traj:
+                raise ValueError(f"noise_sample_Z first dimension must be at least N_traj={N_traj}, got {Z.shape[0]}")
+            if Z.shape[1] < N:
+                raise ValueError(f"noise_sample_Z second dimension must be at least N_steps+1={N}, got {Z.shape[1]}")
+            Z = Z[:N_traj, :N]
 
-            if z.shape[0] < N:
-                raise ValueError(f"noise length must be at least N_steps+1={N}, got {z.shape[0]}")
+        max_nb = min(traj_batch_size, N_traj)
+        d_z = cuda.device_array((max_nb, N), dtype=np.complex128)
+        d_prev = cuda.device_array((max_nb, n_states, self.dim), dtype=np.complex128)
+        d_half = cuda.device_array((max_nb, n_states, self.dim), dtype=np.complex128)
+        d_curr = cuda.device_array((max_nb, n_states, self.dim), dtype=np.complex128)
+        d_k1 = cuda.device_array((max_nb, n_states, self.dim), dtype=np.complex128)
+        d_pred = cuda.device_array((max_nb, n_states, self.dim), dtype=np.complex128)
+        d_hist = cuda.device_array((max_nb, N, self.dim), dtype=np.complex128)
+        d_psi0 = cuda.to_device(psi0_arr)
 
-            host_state[:, :] = 0.0
-            host_state[self._zero_idx, :] = psi0_arr
-            d_prev.copy_to_device(host_state)
+        for batch_start in tqdm(range(0, N_traj, traj_batch_size), desc="Trajectory batches"):
+            batch_end = min(batch_start + traj_batch_size, N_traj)
+            nb = batch_end - batch_start
+
+            z_batch = np.ascontiguousarray(Z[batch_start:batch_end, :], dtype=np.complex128)
+            d_z[:nb, :].copy_to_device(z_batch)
+
+            d_prev_b = d_prev[:nb, :, :]
+            d_half_b = d_half[:nb, :, :]
+            d_curr_b = d_curr[:nb, :, :]
+            d_k1_b = d_k1[:nb, :, :]
+            d_pred_b = d_pred[:nb, :, :]
+            d_hist_b = d_hist[:nb, :, :]
+            d_z_b = d_z[:nb, :]
+
+            blocks_states = ((nb * n_states + tx - 1) // tx, (self.dim + ty - 1) // ty)
+            blocks_batch = ((nb + tx - 1) // tx, (self.dim + ty - 1) // ty)
+
+            _gpu_reset_states_kernel[blocks_states, threadsperblock](d_prev_b, self._zero_idx, d_psi0)
+
+            _gpu_store_zero_state_kernel[blocks_batch, threadsperblock](d_hist_b, d_prev_b, self._zero_idx, 0)
 
             for n in range(self.N_steps):
-                _gpu_matmul_states[blockspergrid, threadsperblock](d_P_half, d_prev, d_half)
+                _gpu_matmul_states_batched[blocks_states, threadsperblock](gpu_const["d_P_half"], d_prev_b, d_half_b)
 
-                _gpu_rhs_kernel[blockspergrid, threadsperblock](
-                    d_k1,
-                    d_half,
-                    d_L,
-                    d_L_dag,
-                    z[n],
-                    d_V,
-                    d_U,
-                    d_lam,
+                _gpu_rhs_predict_kernel[blocks_states, threadsperblock](
+                    d_k1_b,
+                    d_pred_b,
+                    d_half_b,
+                    d_z_b,
+                    gpu_const["d_L"],
+                    gpu_const["d_L_dag"],
+                    gpu_const["d_V"],
+                    gpu_const["d_U"],
+                    gpu_const["d_lam"],
                     n,
-                    d_idx_values,
-                    d_idx_minus,
-                    d_idx_plus,
+                    dt,
+                    gpu_const["d_minus_count"],
+                    gpu_const["d_minus_k"],
+                    gpu_const["d_minus_state"],
+                    gpu_const["d_minus_value"],
+                    gpu_const["d_plus_count"],
+                    gpu_const["d_plus_k"],
+                    gpu_const["d_plus_state"],
                 )
 
-                _gpu_linear2_kernel[blockspergrid, threadsperblock](d_pred, d_half, d_k1, 1.0 + 0.0j, dt + 0.0j)
-
-                _gpu_rhs_kernel[blockspergrid, threadsperblock](
-                    d_curr,
-                    d_pred,
-                    d_L,
-                    d_L_dag,
-                    z[n + 1],
-                    d_V,
-                    d_U,
-                    d_lam,
+                _gpu_rhs_heun_kernel[blocks_states, threadsperblock](
+                    d_curr_b,
+                    d_half_b,
+                    d_k1_b,
+                    d_pred_b,
+                    d_z_b,
+                    gpu_const["d_L"],
+                    gpu_const["d_L_dag"],
+                    gpu_const["d_V"],
+                    gpu_const["d_U"],
+                    gpu_const["d_lam"],
                     n + 1,
-                    d_idx_values,
-                    d_idx_minus,
-                    d_idx_plus,
+                    dt,
+                    gpu_const["d_minus_count"],
+                    gpu_const["d_minus_k"],
+                    gpu_const["d_minus_state"],
+                    gpu_const["d_minus_value"],
+                    gpu_const["d_plus_count"],
+                    gpu_const["d_plus_k"],
+                    gpu_const["d_plus_state"],
                 )
 
-                _gpu_heun_combine_kernel[blockspergrid, threadsperblock](d_curr, d_half, d_k1, d_curr, dt)
-                _gpu_matmul_states[blockspergrid, threadsperblock](d_P_half, d_curr, d_half)
+                _gpu_matmul_states_batched[blocks_states, threadsperblock](gpu_const["d_P_half"], d_curr_b, d_half_b)
+                _gpu_store_zero_state_kernel[blocks_batch, threadsperblock](d_hist_b, d_half_b, self._zero_idx, n + 1)
+                d_prev_b, d_half_b = d_half_b, d_prev_b
 
-                d_half[self._zero_idx, :].copy_to_host(host_zero)
-                psis[traj, n + 1, :] = host_zero
-                d_prev, d_half = d_half, d_prev
+            psis[batch_start:batch_end, :, :] = d_hist_b.copy_to_host()
 
         cuda.synchronize()
         return psis
 
-    def solve(self, N_traj: int, psi0: np.ndarray, backend: str = "auto"):
+    def solve(
+        self,
+        N_traj: int,
+        psi0: np.ndarray,
+        backend: str = "auto",
+        threadsperblock: tuple[int, int] = (128, 4),
+        traj_batch_size: int = 64,
+    ):
         if backend not in ("auto", "python", "numba", "numba-gpu"):
             raise ValueError("backend must be one of: 'auto', 'python', 'numba', 'numba-gpu'")
 
         if backend in ("numba", "numba-gpu"):
-            return self.solve_numba_gpu(N_traj, psi0)
+            return self.solve_numba_gpu(
+                N_traj,
+                psi0,
+                threadsperblock=threadsperblock,
+                traj_batch_size=traj_batch_size,
+            )
 
         if backend == "auto" and _numba_gpu_available():
-            return self.solve_numba_gpu(N_traj, psi0)
+            return self.solve_numba_gpu(
+                N_traj,
+                psi0,
+                threadsperblock=threadsperblock,
+                traj_batch_size=traj_batch_size,
+            )
 
         return self.solve_python(N_traj, psi0)
