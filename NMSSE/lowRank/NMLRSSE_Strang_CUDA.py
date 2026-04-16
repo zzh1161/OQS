@@ -260,6 +260,11 @@ class NMLRSSE_Strang_CUDA:
             self.psi_prev[idx] = self._zero_state.copy()
             self.psi_curr[idx] = self._zero_state.copy()
 
+    def set_lamUV(self, lam, U, V):
+        self.lam = lam
+        self.U = U
+        self.V = V
+
     def compute_low_rank_decomposition(self):
         t0 = time.perf_counter()
         C = np.empty((self.N_steps + 1, self.N_steps + 1), dtype=complex)
